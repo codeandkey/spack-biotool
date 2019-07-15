@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+# biotool
+
+import argparse
+import os
+import re
+import subprocess
+import tempfile
+import textwrap
+
+r_base_packages = ['base', 'compiler', 'datasets', 'graphics', 'grDevices',
+                   'grid', 'methods', 'parallel', 'splines', 'stats', 'stats4',
+                   'tcltk', 'tools', 'utils', 'R', 'BiocManager']
+
+bioconductor_releases = {
+    'RELEASE_3_9': '3.6.0:3.6.9',
+    'RELEASE_3_8': '3.5.0:3.5.9',
+    'RELEASE_3_7': '3.5.0:3.5.9',
+    'RELEASE_3_6': '3.4.0:3.4.9',
+    'RELEASE_3_5': '3.4.0:3.4.9',
+}
+
+def check_table_satisfies_dep(table, dep):
+    """Checks if a dep is already guaranteed by an existing dep table."""
+
+    # table doesn't mention the dependency. so it is not covered.
+    ret = False
+
+    if dep['name'] in table:
+        if compare_versions(dep.get('min_version'), table[dep['name']].get('min_version')) < 1:
+            ret = True
+
+    return ret
+
+def compare_versions(a, b):
+    """Compares which version is newer. returns:
+       1 if <A> is newer than <B>
+       -1 if <B> is newer than <A>
+       0 if <A> is equal to <B>"""
+
+    if a is None:
+        if b is None:
+            return 0
+        return -1
+    if b is None:
+        return 1
+
+    print('Comparing {0} with {1}..'.format(a, b))
+
+    # get the string version parts
+    a_vals = tuple(map(int, re.split('\.|\-', a)))
+    b_vals = tuple(map(int, re.split('\.|\-', b)))
+
+    if a_vals > b_vals:
+        return 1
+    elif b_vals > a_vals:
+        return -1
+    else:
+        return 0
+
+def newest_version(a, b):
+    """Returns the most recent version between <a> and <b>."""
+    if compare_versions(a, b) == 1:
+        return a
+
+    return b
+
+def get_spack_name_for(name):
+    """Converts an R package name to the spack equivalent."""
+    name = name.lower().replace('.', '-')
+
+    if name == 'r':
+        return name
+
+    if not name.startswith('r-'):
+        name = 'r-%s' % name
+
+    return name
+
+def get_spack_package_exists(name):
+    """Returns true iff the exact package name <name> exists in spack.
+       Will throw an exception if the spack command fails."""
+
+    print('Checking if spack package %s exists' % name)
+
+    output = subprocess.check_output(['spack', 'list', name]).decode(sys.stdout.encoding)
+    packages = output.split('\n')[:-1]
+    return name in packages
+
+def build_bio_package(args):
+    """Clones a package and builds the dependency graph. Fails if dependencies
+       are missing in spack or builds them if 'recursive' is enabled."""
+
+    # move to a better working dir
+    working_dir = tempfile.mkdtemp('.biotool')
+    os.chdir(working_dir)
+
+    print('Cloning {0} in {1}..'.format(args.name, working_dir))
+    
+    subprocess.run(['git', 'clone', 'https://git.bioconductor.org/packages/{0}.git'.format(args.name)])
+
+    os.chdir(args.name)
+    print('Working in {0}..'.format(os.getcwd()))
+
+    # find spack package dir
+    spack_path = subprocess.check_output(['which', 'spack'], text=True).strip()
+    packages_dir = os.path.join(os.path.dirname(os.path.dirname(spack_path)),
+                                'var/spack/repos/builtin/packages/')
+
+    spack_pkgname = get_spack_name_for(args.name)
+    spack_pkgdir = os.path.join(packages_dir, spack_pkgname)
+
+    print('Using package directory {0}'.format(spack_pkgdir))
+
+    # build a list of deptables, newest first
+    infotables = {}
+    versions = []
+    pkg_title = None
+    pkg_desc = None
+
+    for release, r_constraint in bioconductor_releases.items():
+        info = get_bio_release_info(release)
+
+        if info is None:
+            print('Skipping bioconductor release {0}..', release)
+
+        # check we don't already have info for this version
+        if info['version'] in infotables:
+            print('Skipping existing version {0}, already provided in newer bioconductor release {1}'.format(info['version'], infotables[info['version']]['bioconductor_release']))
+            continue
+
+        info['bioconductor_release'] = release
+        info['r_constraint'] = r_constraint
+        infotables[info['version']] = info
+
+        versions.append(info['version'])
+
+        # take the first description we find
+        if pkg_title is None:
+            pkg_title = info['title']
+        
+        if pkg_desc is None:
+            pkg_desc = info['description']
+
+        print('Found information on {0} version {1}'.format(args.name, info['version']))
+
+    if pkg_title is None or pkg_desc is None:
+        print('No valid title or description found!')
+        return None
+
+    # build the package file
+    print('Building package file..')
+    print('Title: {0}'.format(pkg_title))
+    print('Desc: {0}'.format(pkg_desc))
+
+    # make and navigate to the package dir
+    os.makedirs(spack_pkgdir, exist_ok=True)
+    os.chdir(spack_pkgdir)
+
+    # generate boilerplate
+    contents =  '# Copyright 2013-2019 Lawrence Livermore National Security, LLC and other\n'
+    contents += '# Spack Project Developers. See the top-level COPYRIGHT file for details.\n'
+    contents += '#\n'
+    contents += '# SPDX-License-Identifier: (Apache-2.0 OR MIT)\n'
+    contents += '\nfrom spack import *\n\n\n'
+    contents += 'class R{0}(RPackage):\n'.format(args.name.capitalize())
+
+    # generate description
+    desc_lines = textwrap.wrap(pkg_title + '.', 75,
+                               initial_indent = '"""',
+                               subsequent_indent = '   ',
+                               replace_whitespace=False)
+
+    desc_lines.append('')
+
+    desc_lines.extend(textwrap.wrap(pkg_desc + '"""', 75,
+                                    initial_indent = '   ',
+                                    subsequent_indent = '   ',
+                                    replace_whitespace=False))
+    
+    for line in desc_lines:
+        if len(line) == 0:
+            contents += '\n'
+        else:
+            contents += '    {0}\n'.format(line)
+
+    contents += '\n'
+
+    # write homepage and git urls
+    contents += '    homepage = "https://bioconductor.org/packages/{0}"\n'.format(args.name)
+    contents += '    git      = "https://git.bioconductor.org/packages/{0}.git"\n'.format(args.name)
+
+    contents += '\n'
+
+    # write versions and commit hashes
+    for ver, info in infotables.items():
+        contents += "    version('{0}', commit='{1}')\n".format(info['version'], info['commit'])
+
+    contents += '\n'
+
+    # write R dependencies
+    for ver, info in infotables.items():
+        contents += "    depends_on('r@{0}', when='@{1}', type=('build', 'run'))\n".format(info['r_constraint'], ver)
+
+    contents += '\n'
+
+    last_table = {} # used for detecting if new deplines are needed
+
+    # go through versions in reverse order, adding dependencies when needed
+    for ver in reversed(versions):
+        info = infotables[ver]
+        wrote_line = False
+
+        for key, val in sorted(info['deps'].items(), key = lambda x: x[0].lower()):
+            if val['name'] in last_table:
+                if compare_versions(last_table[val['name']], val.get('min_version')) >= 0:
+                    #print('skipping {0}@{1}, already in table at version {2}'.format(val['name'], val.get('min_version'), last_table.get(val['name'])))
+                    continue
+
+            last_table[val['name']] = val.get('min_version')
+
+            # add the dep line
+            req_ver = ''
+
+            if val.get('min_version'):
+                req_ver='@{0}:'.format(val['min_version'])
+
+            contents += "    depends_on('{0}{1}', when='@{2}:', type=('build', 'run'))\n".format(get_spack_name_for(val['name']), req_ver, ver)
+            wrote_line = True
+
+        if wrote_line:
+            contents += '\n'
+
+    # remove extra trailing whitespace
+    contents = contents.strip() + '\n'
+
+    with open('package.py', 'w') as f:
+        f.write(contents)
+
+def parse_dep_constraints(dep):
+    # figure out dep names and min version
+
+    # normalize whitespace
+    dep = ' '.join(dep.split()).strip()
+
+    print('Parsing depline "{0}"'.format(dep))
+
+    output = {}
+    name = re.search(r'^([A-Za-z0-9\-\.]+)', dep)
+
+    if name:
+        output['name'] = name.group(1)
+    else:
+        return None
+
+    minver = re.search(r'\(\s*>=\s*(\S+)\s*\)', dep)
+
+    if minver:
+        output['min_version'] = minver.group(1)
+
+    return output
+
+def filter_dep_constraints(dep):
+    if dep is None:
+        return False
+    return dep['name'] not in r_base_packages
+
+def get_bio_release_info(tag):
+    """Grabs information about a package from a certain Bioconductor release.
+       The tag is passed directly to 'git checkout'. The function assumes
+       the current working directory is within the target package repository."""
+
+    # check out the release
+    try:
+        subprocess.run(['git', 'checkout', '-q', tag])
+    except Exception as e:
+        print('Checking out {0} failed, ignoring this release')
+        return None
+
+    # parse the DESCRIPTION for the version and dependencies
+    output = {}
+
+    with open('DESCRIPTION', 'r') as f:
+        contents = f.read()
+
+        # parse package version
+        output['version'] = re.search('Version: (.+)', contents).group(1)
+
+        # parse package title and description
+        output['title'] = ' '.join(re.search('Title: (.+?)\n(?:\S|\Z)', contents, re.DOTALL).group(1).split())
+        output['description'] = ' '.join(re.search('Description: (.+?)\n(?:\S|\Z)', contents, re.DOTALL).group(1).split())
+
+        # get depends, imports, linkingto info
+        package_depends = re.search('Depends: (.+?)\n(?:\S|\Z)', contents, re.DOTALL)
+        package_imports = re.search('Imports: (.+?)\n(?:\S|\Z)', contents, re.DOTALL)
+        package_linkingto = re.search('LinkingTo: (.+?)\n(?:\S|\Z)', contents, re.DOTALL)
+
+        dep_list = []
+
+        if package_depends:
+            dep_list.extend(package_depends.group(1).split(','))
+
+        if package_imports:
+            dep_list.extend(package_imports.group(1).split(','))
+            
+        if package_linkingto:
+            print(package_linkingto.group(1))
+            dep_list.extend(package_linkingto.group(1).split(','))
+        
+        # strip out whitespace
+        dep_list = list(map(lambda x: ' '.join(x.strip().split()), dep_list))
+
+        # parse dep constraints
+        dep_list = list(map(parse_dep_constraints, dep_list))
+
+        # remove bad constraints 
+        dep_list = list(filter(filter_dep_constraints, dep_list))
+
+        # merge duplicate constraints into one list
+        dep_table = {}
+
+        for dep in dep_list:
+            if dep['name'] in dep_table:
+                # keep the newest constraint version
+                dep_table[dep['name']]['min_version'] = newest_version(dep.get('min_version'), dep_table[dep['name']].get('min_version'))
+            else:
+                dep_table[dep['name']] = dep
+
+        output['deps'] = dep_table
+
+    # get the commit hash
+    output['commit'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+
+    return output
+
+# parse arguments and start working
+parser = argparse.ArgumentParser(description='Generate Spack packages from Bioconductor')
+parser.add_argument('name', help='Bioconductor package name')
+
+args = parser.parse_args()
+
+build_bio_package(args)
