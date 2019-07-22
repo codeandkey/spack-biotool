@@ -291,9 +291,9 @@ def get_bio_release_info(tag):
         output['description'] = ' '.join(re.search('Description: (.+?)\n(?:\S|\Z)', contents, re.DOTALL).group(1).split())
 
         # get depends, imports, linkingto info
-        package_depends = re.search('Depends: (.+?)\n(?:\S|\Z)', contents, re.DOTALL)
-        package_imports = re.search('Imports: (.+?)\n(?:\S|\Z)', contents, re.DOTALL)
-        package_linkingto = re.search('LinkingTo: (.+?)\n(?:\S|\Z)', contents, re.DOTALL)
+        package_depends = re.search('Depends:(.+?)\n(?:\S|\Z)', contents, re.DOTALL)
+        package_imports = re.search('Imports:(.+?)\n(?:\S|\Z)', contents, re.DOTALL)
+        package_linkingto = re.search('LinkingTo:(.+?)\n(?:\S|\Z)', contents, re.DOTALL)
 
         dep_list = []
 
@@ -304,7 +304,6 @@ def get_bio_release_info(tag):
             dep_list.extend(package_imports.group(1).split(','))
             
         if package_linkingto:
-            print(package_linkingto.group(1))
             dep_list.extend(package_linkingto.group(1).split(','))
         
         # strip out whitespace
